@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install pytest requests
+        run: pip install pytest requests python-dotenv
       - name: Run unit tests
         run: pytest -q
       - name: Build app Docker image (validates the Dockerfile)
