@@ -20,7 +20,7 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest requests python-dotenv
       - name: Run unit tests
-        run: pytest -q
+        run: python -m pytest tests/ -q
       - name: Build app Docker image (validates the Dockerfile)
         run: docker build -t airsafe-app:ci app/
 
