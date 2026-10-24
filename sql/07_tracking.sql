@@ -19,6 +19,21 @@ CREATE TABLE IF NOT EXISTS airsafe.pipeline_runs (
   status STRING
 );
 
+-- Deployment prerequisite: airsafe.pm25_estimates stores numerical PM2.5 estimates
+-- from Open-Meteo Air Quality API (distinct from measured ground station data).
+-- Run this script once before deploying the automated pipeline.
+-- In addition, pipeline/main.py defensively issues CREATE TABLE IF NOT EXISTS
+-- before running MERGE_ESTIMATES_SQL to prevent missing table errors.
+CREATE TABLE IF NOT EXISTS airsafe.pm25_estimates (
+  ts TIMESTAMP,
+  pm25_estimate FLOAT64,
+  fetched_at TIMESTAMP,
+  source STRING,
+  data_kind STRING,
+  latitude FLOAT64,
+  longitude FLOAT64
+);
+
 -- Seed the log with the forecast we already have (only if the log is empty)
 INSERT INTO airsafe.forecast_log
 SELECT CURRENT_TIMESTAMP(), (SELECT MAX(ts) FROM airsafe.pm25_clean),

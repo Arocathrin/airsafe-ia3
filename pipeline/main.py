@@ -8,6 +8,8 @@ Local dry run (fetch + clean only, no cloud writes):  set DRY_RUN=1 & python mai
 Force a retrain on a deployed function: add ?force=1 to the URL.
 """
 import json
+import logging
+import math
 import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -16,6 +18,7 @@ import requests
 
 OPENAQ = "https://api.openaq.org/v3"
 METEO = "https://api.open-meteo.com/v1/forecast"
+METEO_AQ = "https://air-quality-api.open-meteo.com/v1/air-quality"
 IST = timezone(timedelta(hours=5, minutes=30))
 HOURLY_VARS = "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure,precipitation"
 
@@ -32,6 +35,33 @@ WHEN NOT MATCHED THEN
   INSERT (ts_ist, pm25, temp_c, rh_pct, wind_kmh, pressure_hpa, precip_mm, pm25_flag)
   VALUES (S.ts_ist, S.pm25, S.temp_c, CAST(ROUND(S.rh_pct) AS INT64),
           S.wind_kmh, S.pressure_hpa, S.precip_mm, S.pm25_flag)
+"""
+
+CREATE_ESTIMATES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS airsafe.pm25_estimates (
+  ts TIMESTAMP,
+  pm25_estimate FLOAT64,
+  fetched_at TIMESTAMP,
+  source STRING,
+  data_kind STRING,
+  latitude FLOAT64,
+  longitude FLOAT64
+)
+"""
+
+MERGE_ESTIMATES_SQL = """
+MERGE airsafe.pm25_estimates T
+USING airsafe.stg_pm25_estimates S
+ON T.ts = S.ts AND T.source = S.source
+WHEN MATCHED THEN
+  UPDATE SET pm25_estimate = S.pm25_estimate,
+             fetched_at = S.fetched_at,
+             data_kind = IF(T.data_kind = 'historical' AND S.data_kind = 'forecast', T.data_kind, S.data_kind),
+             latitude = S.latitude,
+             longitude = S.longitude
+WHEN NOT MATCHED THEN
+  INSERT (ts, pm25_estimate, fetched_at, source, data_kind, latitude, longitude)
+  VALUES (S.ts, S.pm25_estimate, S.fetched_at, S.source, S.data_kind, S.latitude, S.longitude)
 """
 
 RETRAIN_SQL = """
@@ -97,6 +127,18 @@ def fetch_weather(lat, lon):
     return r.json()
 
 
+def fetch_pm25_estimates(lat, lon):
+    """Fetch hourly PM2.5 model estimates from Open-Meteo Air Quality API."""
+    r = requests.get(
+        METEO_AQ,
+        params={"latitude": lat, "longitude": lon, "hourly": "pm2_5",
+                "past_days": 2, "forecast_days": 2, "timezone": "Asia/Kolkata"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 # ---------------------------------------------------------------- transform
 def transform(pm_rows, weather):
     """Hourly IST grid up to the last PM2.5 hour, with validation flags."""
@@ -152,6 +194,70 @@ def transform(pm_rows, weather):
     return rows
 
 
+def parse_pm25_estimates(data, lat, lon, fetched_at=None):
+    """Parse Open-Meteo air quality response into clean estimate records.
+
+    Skips null, non-finite, and negative values.
+    Labels values as 'historical' or 'forecast' with source='Open-Meteo Air Quality API'.
+    Preserves supplied latitude and longitude.
+    """
+    if fetched_at is None:
+        fetched_at = datetime.now(timezone.utc)
+    elif fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+
+    fetched_at_utc = fetched_at.astimezone(timezone.utc)
+    fetched_at_ist = fetched_at.astimezone(IST)
+    fetched_str = fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S+00:00")
+
+    lat_val = float(lat)
+    lon_val = float(lon)
+
+    hourly = (data or {}).get("hourly", {})
+    times = hourly.get("time", [])
+    values = hourly.get("pm2_5", [])
+
+    dedup = {}
+    for t_str, raw_val in zip(times, values):
+        if raw_val is None:
+            continue
+        try:
+            val = float(raw_val)
+        except (ValueError, TypeError):
+            continue
+        if not math.isfinite(val) or val < 0:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(t_str)
+        except (ValueError, TypeError):
+            continue
+
+        if dt.tzinfo is None:
+            dt_ist = dt.replace(tzinfo=IST)
+        else:
+            dt_ist = dt.astimezone(IST)
+
+        data_kind = "historical" if dt_ist <= fetched_at_ist else "forecast"
+        ts_str = dt_ist.isoformat()
+
+        source_name = "Open-Meteo Air Quality API"
+        key = (ts_str, source_name)
+        if key in dedup and dedup[key]["data_kind"] == "historical" and data_kind == "forecast":
+            continue
+
+        dedup[key] = {
+            "ts": ts_str,
+            "pm25_estimate": val,
+            "fetched_at": fetched_str,
+            "source": source_name,
+            "data_kind": data_kind,
+            "latitude": lat_val,
+            "longitude": lon_val,
+        }
+    return list(dedup.values())
+
+
 # ---------------------------------------------------------------- run
 def run(dry=False, force=False):
     pm = fetch_pm25(os.environ["SENSOR_ID"], int(os.environ.get("HOURS_BACK", 720)))
@@ -159,9 +265,23 @@ def run(dry=False, force=False):
     rows = transform(pm, wx)
     usable = sum(r["pm25"] is not None for r in rows)
     summary = {"api_rows": len(pm), "hourly_rows": len(rows), "usable_hours": usable}
+
+    now_utc = datetime.now(timezone.utc)
+    estimate_rows = []
+    try:
+        raw_aq = fetch_pm25_estimates(os.environ["LAT"], os.environ["LON"])
+        estimate_rows = parse_pm25_estimates(raw_aq, os.environ["LAT"], os.environ["LON"], fetched_at=now_utc)
+        summary["estimate_rows"] = len(estimate_rows)
+    except Exception as e:
+        logging.warning("Open-Meteo air quality ingestion failed: %s", e)
+        summary["estimate_rows"] = 0
+        summary["estimate_error"] = str(e)
+
     if dry:
         print(summary)
         print("last 3 rows:", json.dumps(rows[-3:], indent=1))
+        if estimate_rows:
+            print("last 3 estimate rows:", json.dumps(estimate_rows[-3:], indent=1))
         return summary
 
     from google.cloud import bigquery, storage
@@ -178,6 +298,26 @@ def run(dry=False, force=False):
 
     def q(sql):
         return list(bq.query(sql, location="US").result())
+
+    if estimate_rows:
+        try:
+            est_schema = [
+                bigquery.SchemaField("ts", "TIMESTAMP"),
+                bigquery.SchemaField("pm25_estimate", "FLOAT"),
+                bigquery.SchemaField("fetched_at", "TIMESTAMP"),
+                bigquery.SchemaField("source", "STRING"),
+                bigquery.SchemaField("data_kind", "STRING"),
+                bigquery.SchemaField("latitude", "FLOAT"),
+                bigquery.SchemaField("longitude", "FLOAT"),
+            ]
+            bq.load_table_from_json(
+                estimate_rows, "airsafe.stg_pm25_estimates", location="US",
+                job_config=bigquery.LoadJobConfig(schema=est_schema, write_disposition="WRITE_TRUNCATE"),
+            ).result()
+            q(CREATE_ESTIMATES_TABLE_SQL)
+            q(MERGE_ESTIMATES_SQL)
+        except Exception as e:
+            logging.warning("Writing Open-Meteo estimates to BigQuery failed: %s", e)
 
     before = q("SELECT MAX(ts) AS m FROM airsafe.pm25_clean")[0].m
     if rows:

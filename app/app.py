@@ -64,8 +64,11 @@ def gemini_advisory(audience: str, category: str, peak: float, peak_time: str,
             model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), contents=prompt
         )
         return resp.text
-    except Exception:
+
+    except Exception as e:
+        print(f"Gemini API error: {type(e).__name__}: {e}", flush=True)
         return None
+
 
 
 st.title("AirSafe: PM2.5 forecast and health-risk early warning")
@@ -77,6 +80,21 @@ best = load(f"SELECT * FROM `{T}.best_windows` ORDER BY clean_rank LIMIT 3")
 health = load(f"SELECT * FROM `{T}.v_pipeline_health`")
 guide = load(f"SELECT category, health_impact FROM `{T}.advisory_guidelines`")
 latest = load(f"SELECT ts, pm25, category FROM `{T}.v_history` ORDER BY ts DESC LIMIT 1")
+try:
+    estimates = load(
+        f"SELECT ts, DATETIME(ts, 'Asia/Kolkata') AS ts_ist, pm25_estimate, fetched_at, source, data_kind "
+        f"FROM `{T}.pm25_estimates` "
+        f"WHERE data_kind = 'historical' "
+        f"ORDER BY ts DESC LIMIT 1"
+    )
+    if estimates.empty:
+        estimates = load(
+            f"SELECT ts, DATETIME(ts, 'Asia/Kolkata') AS ts_ist, pm25_estimate, fetched_at, source, data_kind "
+            f"FROM `{T}.pm25_estimates` "
+            f"ORDER BY ts DESC LIMIT 1"
+        )
+except Exception:
+    estimates = pd.DataFrame()
 
 last_obs = health["last_observation"].iloc[0]
 now_ist = datetime.now(IST).replace(tzinfo=None)
@@ -181,6 +199,30 @@ with tab1:
     line = base.mark_line().encode(y="pm25_pred:Q", tooltip=["ts:T", "pm25_pred:Q", "category:N"])
     st.altair_chart(band + line, use_container_width=True)
     st.caption("Line = forecast, shaded band = 90% prediction interval.")
+
+    st.subheader("Model-based PM2.5 estimate (Open-Meteo)")
+    if estimates.empty:
+        st.info("No Open-Meteo model-based PM2.5 estimates available.")
+    else:
+        e = estimates.iloc[0]
+        e_pm25 = float(e["pm25_estimate"])
+        e_ts = pd.to_datetime(e["ts_ist"]) if "ts_ist" in e and pd.notna(e["ts_ist"]) else pd.to_datetime(e["ts"])
+        e_fetched = pd.to_datetime(e["fetched_at"])
+
+        est_age_h = (now_ist - e_ts).total_seconds() / 3600
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        fetch_age_h = (now_utc - e_fetched).total_seconds() / 3600
+        if est_age_h > 6 or fetch_age_h > 6:
+            st.warning(
+                f"⚠️ Open-Meteo estimate is stale: latest estimate is {est_age_h:.1f} hours old "
+                f"(threshold: 6 hours)."
+            )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Model estimate", f"{e_pm25:.1f} ug/m3")
+        c2.metric("Observation time", f"{e_ts:%d %b %Y, %H:%M} IST")
+        c3.metric("Fetch time", f"{e_fetched:%d %b %Y, %H:%M} UTC")
+        st.caption("Model-based PM2.5 estimate from Open-Meteo Air Quality API. Not a direct ground station measurement.")
 
     left, right = st.columns(2)
     with left:
