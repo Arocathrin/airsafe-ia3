@@ -60,9 +60,12 @@ def gemini_advisory(audience: str, category: str, peak: float, peak_time: str,
     try:
         from google import genai
 
-        resp = genai.Client(api_key=key).models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), contents=prompt
-        )
+        
+        with genai.Client(api_key=key) as gemini_client:
+            resp = gemini_client.models.generate_content(
+                model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=prompt,
+            )
         return resp.text
 
     except Exception as e:
